@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from tqdm import tqdm
 from enum import Enum
 
-from trainrl import RLConfig, RLAlgorithm, PPOTrainer, REINFORCETrainer
+from trainrl import RLConfig, RLAlgorithm, PPOTrainer, REINFORCETrainer, BaseModel
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -137,25 +137,13 @@ def main():
         logger.info(f"Starting RL training with model: {config.model_name}")
         logger.info(f"Using algorithm: {config.rl_algorithm.value}")
     
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    # Load model
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_name,
-        torch_dtype=torch.float32,
-    )
-    model = model.cuda()
-    
-    # Wrap with FSDP
-    auto_wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=1e6)
-    model = FSDP(
-        model,
-        auto_wrap_policy=auto_wrap_policy,
-        device_id=torch.cuda.current_device(),
-    )
+    # Load tokenizer and model
+    base_model = BaseModel(config.model_name, fsdp=True)
+    base_model.freeze_all_layers()
+    base_model.unfreeze_last_n_layers(n=2)
+
+    model = base_model.model
+    tokenizer = base_model.tokenizer
     
     if dist.get_rank() == 0:
         logger.info("Model wrapped with FSDP successfully")

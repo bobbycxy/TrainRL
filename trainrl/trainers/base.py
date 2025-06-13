@@ -7,61 +7,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
-def generate_with_model(model, tokenizer, input_ids, attention_mask, max_new_tokens=150):
-    """Generate text using the model (manual implementation for FSDP compatibility)"""
-    if dist.get_rank() == 0:
-        print(f"Generate: input_ids shape {input_ids.shape}, max_new_tokens {max_new_tokens}")
-    
-    model.eval()
-    generated_ids = input_ids.clone()
-    batch_size = input_ids.size(0)
-    
-    # Track which sequences are finished
-    finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
-    
-    with torch.no_grad():
-        for step in range(max_new_tokens):
-            if dist.get_rank() == 0 and step % 5 == 0:
-                print(f"Generation step {step}/{max_new_tokens}")
-                
-            # Skip if all sequences are finished
-            if finished.all():
-                break
-                
-            # Get current attention mask
-            current_attention_mask = torch.ones_like(generated_ids)
-            
-            try:
-                outputs = model(generated_ids, attention_mask=current_attention_mask)
-                logits = outputs.logits
-                
-                # Get next token probabilities
-                next_token_logits = logits[:, -1, :]
-                next_token_probs = F.softmax(next_token_logits, dim=-1)
-                
-                # Sample next token (you could also use greedy or beam search)
-                next_token = torch.multinomial(next_token_probs, 1)
-                
-                # Append to generated sequence
-                generated_ids = torch.cat([generated_ids, next_token], dim=-1)
-                
-                # Check for EOS tokens in the batch
-                if tokenizer.eos_token_id is not None:
-                    # Mark sequences as finished if they generate EOS token
-                    eos_generated = (next_token.squeeze(-1) == tokenizer.eos_token_id)
-                    finished = finished | eos_generated
-                    
-            except Exception as e:
-                if dist.get_rank() == 0:
-                    print(f"Error during generation step {step}: {e}")
-                break
-    
-    if dist.get_rank() == 0:
-        print(f"Generation completed. Final shape: {generated_ids.shape}")
-    
-    return generated_ids
-
+from trainrl.models.base import generate_with_model
 
 class RewardFunction:
     """Rule-based reward function for mathematical reasoning"""
