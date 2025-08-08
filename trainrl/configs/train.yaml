@@ -1,0 +1,17 @@
+wandb:
+  wandb_log: False
+  project_name: trainrl
+  group_namee: pilot
+
+model_name: Qwen/Qwen3-1.7B
+tokenizer_type: huggingface
+embedding_model_type: huggingface
+core_model_type: huggingface
+model_head_type: huggingface
+hidden_size: 2048
+
+trainer:
+  update_every: 8
+  num_steps: 100
+  batch_size: 2
+  max_new_tokens: 32
