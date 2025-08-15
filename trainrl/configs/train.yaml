@@ -9,8 +9,10 @@ embedding_model_type: huggingface
 core_model_type: huggingface
 model_head_type: huggingface
 hidden_size: 2048
+reward_distribution: uniform
 
 trainer:
+  parallelism: fsdp
   update_every: 8
   num_steps: 100
   batch_size: 2

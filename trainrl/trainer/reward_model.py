@@ -9,15 +9,35 @@ class HFRewardModel(nn.Module):
         self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
         self.model.eval()
 
-    def forward(self, input_ids):
-        with torch.no_grad():
-            # Decode from token ids to text
-            decoded = [self.tokenizer.decode(x, skip_special_tokens=True) for x in input_ids]
-            enc = self.tokenizer(decoded, return_tensors="pt", padding=True, truncation=True, max_length=512)
-            enc = {k: v.to(input_ids.device) for k, v in enc.items()}
+    def forward(self, input_texts):
+        """
+        Forward pass for reward model.
+        
+        Args:
+            input_texts: List of strings (prompt + completion texts)
             
+        Returns:
+            scores: [B] tensor of reward scores
+        """
+        with torch.no_grad():
+            # Tokenize the input texts using the reward model's tokenizer
+            enc = self.tokenizer(
+                input_texts, 
+                return_tensors="pt", 
+                padding=True, 
+                truncation=True, 
+                max_length=512
+            )
+            
+            # Move tokenized inputs to the same device as the model
+            device = next(self.model.parameters()).device
+            enc = {k: v.to(device) for k, v in enc.items()}
+            
+            # Get reward scores from the model
             outputs = self.model(**enc)
             scores = outputs.logits.squeeze(-1)  # [B]
-            # Expand to sequence length and normalize
-            scores = torch.tanh(scores) * 5.0  # Bound rewards to reasonable range
-            return scores.unsqueeze(1).expand(-1, input_ids.shape[1])  # [B, T]
+            
+            # Bound rewards to reasonable range
+            scores = torch.tanh(scores) * 5.0
+            
+            return scores  # Return [B] tensor, expansion handled in caller

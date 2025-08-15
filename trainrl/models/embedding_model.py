@@ -3,9 +3,7 @@ Code that will load the embedding layer of the model.
 
 This will be used to generate embeddings for the input data.
 '''
-import os
 import torch
-from transformers import AutoModelForCausalLM
 from models.components.tokenizer import build_tokenizer
 from models.utils import build_huggingface_model
 

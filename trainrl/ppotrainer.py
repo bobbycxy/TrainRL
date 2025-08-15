@@ -2,8 +2,33 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    BackwardPrefetch,
+    ShardingStrategy,
+    CPUOffload,
+)
+from torch.distributed.fsdp.fully_sharded_data_parallel import (
+    FullStateDictConfig,
+    StateDictType,
+)
+from torch.distributed.fsdp.wrap import (
+    transformer_auto_wrap_policy,
+    size_based_auto_wrap_policy,
+    enable_wrap,
+    wrap,
+)
+from functools import partial
 from copy import deepcopy
 import numpy as np
+import os
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+from transformers.models.gpt2.modeling_gpt2 import GPT2Block
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 class ValueHead(nn.Module):
     def __init__(self, hidden_size):
@@ -15,18 +40,15 @@ class ValueHead(nn.Module):
     
     def forward(self, hidden_state):
         return self.value(hidden_state).squeeze(-1) # [B, T]
-    
-class PPOTrainer:
+
+class PPOTrainerFSDP:
     def __init__(
         self, model, tokenizer, value_head, optimizer, reward_model,
         gamma=0.99, lam=0.95, clip_eps=0.2, c1=0.5, c2=0.01,
-        ppo_epochs=4, batch_size=4, max_grad_norm=1.0
+        ppo_epochs=4, batch_size=4, max_grad_norm=1.0,
+        rank=0, world_size=1, use_mixed_precision=True
     ):
-        self.model = model
         self.tokenizer = tokenizer
-        self.value_head = value_head
-        self.optimizer = optimizer
-        self.reward_model = reward_model
         self.gamma = gamma
         self.lam = lam
         self.clip_eps = clip_eps
@@ -35,11 +57,27 @@ class PPOTrainer:
         self.ppo_epochs = ppo_epochs
         self.batch_size = batch_size
         self.max_grad_norm = max_grad_norm
-
-        self.old_model = deepcopy(model)
-        self.old_model.eval()
-        for p in self.old_model.parameters():
-            p.requires_grad = False
+        self.rank = rank
+        self.world_size = world_size
+        
+        # Setup mixed precision if requested
+        self.mixed_precision = None
+        if use_mixed_precision:
+            self.mixed_precision = MixedPrecision(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.bfloat16,
+                buffer_dtype=torch.bfloat16,
+            )
+        
+        # Wrap models with FSDP
+        self.model = model
+        self.value_head = value_head
+        self.optimizer = optimizer
+        self.reward_model = reward_model
+        
+        # SOLUTION 1: Don't create old_model in __init__
+        # We'll create it later in setup_training_fsdp and assign it
+        self.old_model = None
 
     def compute_gae(self, rewards, values, mask):
         B, T = rewards.shape
@@ -99,7 +137,18 @@ class PPOTrainer:
 
         for epoch in range(self.ppo_epochs):
             dataset = TensorDataset(input_ids, attention_mask, prompt_mask, actions, rewards, old_log_probs, old_values)
-            dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+            
+            # Use DistributedSampler for multi-GPU training
+            sampler = DistributedSampler(dataset, num_replicas=self.world_size, rank=self.rank) if self.world_size > 1 else None
+            dataloader = DataLoader(
+                dataset, 
+                batch_size=self.batch_size, 
+                shuffle=(sampler is None),
+                sampler=sampler
+            )
+            
+            if sampler:
+                sampler.set_epoch(epoch)
 
             for batch in dataloader:
                 input_ids_b, attn_mask_b, prompt_mask_b, actions_b, rewards_b, old_log_probs_b, old_values_b = batch
@@ -148,18 +197,24 @@ class PPOTrainer:
 
                 # Check for NaN/inf before backward pass
                 if not torch.isfinite(total_loss):
-                    print(f"Warning: Non-finite loss detected: {total_loss.item()}")
+                    if self.rank == 0:
+                        print(f"Warning: Non-finite loss detected: {total_loss.item()}")
                     continue
 
                 # Backward pass
                 self.optimizer.zero_grad()
                 total_loss.backward()
                 
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(
-                    list(self.model.parameters()) + list(self.value_head.parameters()), 
-                    self.max_grad_norm
-                )
+                # Gradient clipping - FSDP compatible
+                if isinstance(self.model, FSDP):
+                    self.model.clip_grad_norm_(self.max_grad_norm)
+                    if isinstance(self.value_head, FSDP):
+                        self.value_head.clip_grad_norm_(self.max_grad_norm)
+                else:
+                    torch.nn.utils.clip_grad_norm_(
+                        list(self.model.parameters()) + list(self.value_head.parameters()), 
+                        self.max_grad_norm
+                    )
                 
                 self.optimizer.step()
 
@@ -172,7 +227,23 @@ class PPOTrainer:
         }
 
     def update_old_policy(self):
-        self.old_model.load_state_dict(self.model.state_dict())
+        """Update old policy with FSDP state dict handling"""
+        if isinstance(self.model, FSDP):
+            with FSDP.state_dict_type(
+                self.model, 
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
+            ):
+                model_state = self.model.state_dict()
+            
+            with FSDP.state_dict_type(
+                self.old_model,
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
+            ):
+                self.old_model.load_state_dict(model_state)
+        else:
+            self.old_model.load_state_dict(self.model.state_dict())
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
@@ -197,35 +268,92 @@ class HFRewardModel(nn.Module):
             return scores.unsqueeze(1).expand(-1, input_ids.shape[1])  # [B, T]
 
 
-# Model + tokenizer setup
+# Model + tokenizer setup with FSDP
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from torch.optim import AdamW
 
-def setup_training():
-    base = "Qwen/Qwen3-1.7B"  # Alternative model, or use your original "Qwen/Qwen3-1.7B"
+def setup_training_fsdp(rank, world_size):
+    """Setup training with FSDP support"""
+    
+    # Initialize process group
+    if world_size > 1:
+        # Check if already initialized (when using torchrun)
+        if not dist.is_initialized():
+            # Manual initialization
+            import socket
+            os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', 'localhost')
+            os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '12355')
+            dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        torch.cuda.set_device(rank)
+    
+    device = torch.device(f"cuda:{rank}")
+    
+    base = "Qwen/Qwen3-1.7B"
     tokenizer = AutoTokenizer.from_pretrained(base, trust_remote_code=True)
     
-    # Fix padding issue mentioned in the error
+    # Fix padding issue
     tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = 'left'  # For generation
+    tokenizer.padding_side = 'left'
 
+    # Load model (will be wrapped with FSDP)
     model = AutoModelForCausalLM.from_pretrained(
         base, 
-        torch_dtype=torch.float32
-    ).cuda()
+        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    )
     
-    value_head = ValueHead(model.config.hidden_size).cuda()
-
-    # Use lower learning rate for stability
+    # Create value head
+    value_head = ValueHead(model.config.hidden_size)
+    
+    # Setup auto wrap policy for transformer layers
+    auto_wrap_policy = partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={
+            Qwen3DecoderLayer,  # For Qwen models
+            GPT2Block,  # For GPT2 models
+            LlamaDecoderLayer,  # For Llama models
+            # Add other layer types as needed
+        },
+    )
+    
+    # Mixed precision config
+    mixed_precision = MixedPrecision(
+        param_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+        reduce_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+        buffer_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+    )
+    
+    # Wrap model with FSDP
+    model = FSDP(
+        model,
+        auto_wrap_policy=auto_wrap_policy,
+        mixed_precision=mixed_precision,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        device_id=rank,
+        use_orig_params=True,
+    )
+    
+    # Wrap value head with FSDP
+    value_head = FSDP(
+        value_head,
+        mixed_precision=mixed_precision,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        device_id=rank,
+        use_orig_params=True,
+    )
+    
+    # Create optimizer
     optimizer = AdamW(
         list(model.parameters()) + list(value_head.parameters()), 
-        lr=1e-5,  # Much lower learning rate
+        lr=1e-5,
         weight_decay=0.01
     )
     
-    reward_model = HFRewardModel().cuda()
-
-    trainer = PPOTrainer(
+    # Load reward model
+    reward_model = HFRewardModel().to(device)
+    
+    # Create trainer first (without old_model)
+    trainer = PPOTrainerFSDP(
         model=model,
         tokenizer=tokenizer,
         value_head=value_head,
@@ -234,18 +362,57 @@ def setup_training():
         clip_eps=0.2,
         c1=0.5,
         c2=0.01,
-        ppo_epochs=2,  # Reduce epochs for stability
-        batch_size=2,  # Smaller batch size
-        max_grad_norm=0.5  # More aggressive gradient clipping
+        ppo_epochs=2,
+        batch_size=2,
+        max_grad_norm=0.5,
+        rank=rank,
+        world_size=world_size,
+        use_mixed_precision=True
     )
+    
+    # SOLUTION 1: Create old model separately and assign it
+    # Get state dict from the current model
+    with FSDP.state_dict_type(
+        model, 
+        StateDictType.FULL_STATE_DICT,
+        FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
+    ):
+        model_state = model.state_dict()
+    
+    # Create old model
+    old_model = AutoModelForCausalLM.from_pretrained(
+        base,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    )
+    
+    # Load the state dict into old model before wrapping
+    old_model.load_state_dict(model_state, strict=False)
+    
+    # Now wrap old model with FSDP
+    old_model = FSDP(
+        old_model,
+        auto_wrap_policy=auto_wrap_policy,
+        mixed_precision=mixed_precision,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        device_id=rank,
+        use_orig_params=False,
+    )
+    old_model.eval()
+    for p in old_model.parameters():
+        p.requires_grad = False
+    
+    # Assign old model to trainer
+    trainer.old_model = old_model
     
     return trainer, tokenizer
 
 from datasets import load_dataset
 from random import choices
 
-def generate_and_train(prompts, trainer, tokenizer, max_new_tokens=32):  # Reduced tokens
-    """Generate responses and train with PPO"""
+def generate_and_train_fsdp(prompts, trainer, tokenizer, max_new_tokens=32):
+    """Generate responses and train with PPO (FSDP version)"""
+    
+    device = torch.device(f"cuda:{trainer.rank}")
     
     # Tokenize input prompts
     encodings = tokenizer(
@@ -253,26 +420,29 @@ def generate_and_train(prompts, trainer, tokenizer, max_new_tokens=32):  # Reduc
         return_tensors="pt", 
         padding=True, 
         truncation=True,
-        max_length=256  # Limit input length
+        max_length=256
     )
-    input_ids = encodings.input_ids.cuda()
-    attention_mask = encodings.attention_mask.cuda()
+    input_ids = encodings.input_ids.to(device)
+    attention_mask = encodings.attention_mask.to(device)
     prompt_lens = attention_mask.sum(dim=1).tolist()
 
-    # Generate responses
+    # SOLUTION 1: Use FSDP summon_full_params context for generation
+    # This temporarily gathers all sharded parameters for generation
     with torch.no_grad():
-        generation = trainer.model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            do_sample=True,
-            temperature=0.7,  # Lower temperature for stability
-            top_k=50,
-            top_p=0.9,
-            max_new_tokens=max_new_tokens,
-            pad_token_id=tokenizer.pad_token_id,
-            return_dict_in_generate=True,
-            output_scores=False
-        )
+        # Use summon_full_params to gather all parameters for generation
+        with FSDP.summon_full_params(trainer.model, writeback=False):
+            generation = trainer.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                do_sample=True,
+                temperature=0.7,
+                top_k=50,
+                top_p=0.9,
+                max_new_tokens=max_new_tokens,
+                pad_token_id=tokenizer.pad_token_id,
+                return_dict_in_generate=True,
+                output_scores=False
+            )
         generated_ids = generation.sequences[:, input_ids.shape[1]:]
 
     # Combine prompt + generation
@@ -285,7 +455,7 @@ def generate_and_train(prompts, trainer, tokenizer, max_new_tokens=32):  # Reduc
     # Create masks
     actions = full_input_ids
     B, T = full_input_ids.shape
-    prompt_mask = torch.zeros((B, T), dtype=torch.float32).cuda()
+    prompt_mask = torch.zeros((B, T), dtype=torch.float32).to(device)
     for i, prompt_len in enumerate(prompt_lens):
         prompt_mask[i, prompt_len:] = 1.0
 
@@ -299,23 +469,32 @@ def generate_and_train(prompts, trainer, tokenizer, max_new_tokens=32):  # Reduc
         )
         return metrics
     except Exception as e:
-        print(f"Training error: {e}")
+        if trainer.rank == 0:
+            print(f"Training error: {e}")
         return {"loss": float('inf'), "policy_loss": float('inf'), "value_loss": float('inf'), "entropy": 0.0, "mean_return": 0.0}
 
-# Main training loop
-if __name__ == "__main__":
-    trainer, tokenizer = setup_training()
+def cleanup():
+    """Clean up distributed process group"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+# Main training function for single process
+def train_single_gpu(rank, world_size):
+    """Training function for each GPU"""
+    
+    # Setup
+    trainer, tokenizer = setup_training_fsdp(rank, world_size)
     
     # Load dataset
     try:
         dataset = load_dataset("OpenAssistant/oasst1", split="train")
         prompt_texts = [
             example["text"] for example in dataset
-            if example.get("text") and len(example["text"]) < 200  # Shorter prompts
-        ][:1000]  # Limit dataset size
+            if example.get("text") and len(example["text"]) < 200
+        ][:1000]
     except:
-        # Fallback simple prompts if dataset loading fails
-        print("LOADING FALLBACK")
+        if rank == 0:
+            print("Loading fallback prompts")
         prompt_texts = [
             "What is the capital of France?",
             "Explain photosynthesis in simple terms.",
@@ -324,9 +503,10 @@ if __name__ == "__main__":
             "What causes the seasons to change?"
         ] * 200
 
-    print(f"Loaded {len(prompt_texts)} prompts")
+    if rank == 0:
+        print(f"Loaded {len(prompt_texts)} prompts")
     
-    num_steps = 100  # Reduced for testing
+    num_steps = 100
     batch_size = 2
     max_new_tokens = 32
 
@@ -335,22 +515,61 @@ if __name__ == "__main__":
         prompts_batch = choices(prompt_texts, k=batch_size)
 
         # Run PPO update
-        metrics = generate_and_train(
+        metrics = generate_and_train_fsdp(
             prompts=prompts_batch,
             trainer=trainer,
             tokenizer=tokenizer,
             max_new_tokens=max_new_tokens
         )
 
-        print(f"[Step {step}] Loss: {metrics['loss']:.2f}, Policy: {metrics['policy_loss']:.2f}, "
-              f"Value: {metrics['value_loss']:.2f}, Entropy: {metrics['entropy']:.4f}, Return: {metrics['mean_return']:.2f}")
+        if rank == 0:
+            print(f"[Step {step}] Loss: {metrics['loss']:.2f}, Policy: {metrics['policy_loss']:.2f}, "
+                  f"Value: {metrics['value_loss']:.2f}, Entropy: {metrics['entropy']:.4f}, Return: {metrics['mean_return']:.2f}")
 
-        # Update old policy less frequently for stability
+        # Update old policy less frequently
         if step % 8 == 0 and step > 0:
             trainer.update_old_policy()
-            print("Updated old policy")
+            if rank == 0:
+                print("Updated old policy")
             
         # Early stopping if loss explodes
         if metrics['loss'] > 1000:
-            print("Loss too high, stopping training")
+            if rank == 0:
+                print("Loss too high, stopping training")
             break
+    
+    # Cleanup
+    cleanup()
+
+# Main entry point
+if __name__ == "__main__":
+    import torch.multiprocessing as mp
+    
+    # Check if running with torchrun or single GPU
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        # Running with torchrun - environment variables are already set
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        
+        # Set device based on local rank
+        torch.cuda.set_device(local_rank)
+        
+        # Initialize process group (torchrun handles most of this)
+        if not dist.is_initialized():
+            dist.init_process_group("nccl")
+        
+        train_single_gpu(rank, world_size)
+    else:
+        # Single GPU or manual multiprocessing
+        world_size = torch.cuda.device_count()
+        if world_size > 1:
+            # Set a default master port if not specified
+            os.environ['MASTER_ADDR'] = 'localhost'
+            os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '12355')
+            
+            # Multi-GPU with spawn
+            mp.spawn(train_single_gpu, args=(world_size,), nprocs=world_size, join=True)
+        else:
+            # Single GPU
+            train_single_gpu(0, 1)
