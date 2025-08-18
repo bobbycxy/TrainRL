@@ -1,19 +1,47 @@
 wandb:
-  wandb_log: False
+  wandb_log: true
   project_name: trainrl
-  group_namee: pilot
+  group_name: pilot
+  run_name: ppo_qwen_rlhf
 
-model_name: Qwen/Qwen3-1.7B
-tokenizer_type: huggingface
-embedding_model_type: huggingface
-core_model_type: huggingface
-model_head_type: huggingface
-hidden_size: 2048
-reward_distribution: uniform
+model:
+  model_name: Qwen/Qwen3-1.7B
+  tokenizer_type: huggingface
+  embedding_model_type: huggingface
+  core_model_type: huggingface
+  model_head_type: huggingface
+  hidden_size: 2048
+
+rollout:
+  rollout_batch_size: 32
+  max_new_tokens: 128
+  buffer_size: 128
+
+rewards:
+  type: terminal            # or "dense"
+  reward_ma_beta: 0.9       # smoothing for moving averages
+
+ppo:
+  ppo_epochs: 4
+  ppo_batch_size: 32
+  grad_accum_steps: 8
+  gamma: 0.99
+  lam: 0.95
+  clip_eps: 0.2
+  c1: 0.5
+  c2: 0.01
+  max_grad_norm: 1.0
 
 trainer:
   parallelism: fsdp
   update_every: 8
   num_steps: 100
-  batch_size: 2
-  max_new_tokens: 32
+  eval_interval: 500
+  save_interval: 1000
+
+# optimizer:
+#   lr: 1.0e-5
+#   betas: [0.9, 0.999]
+#   eps: 1.0e-8
+#   weight_decay: 0.01
+#   optimizer_type: adamw

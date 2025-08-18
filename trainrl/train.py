@@ -24,11 +24,11 @@ def run_training(rank, world_size, cfg):
         init_distributed_setup(rank=rank, world_size=world_size)
         device = f"cuda:{rank}"
         
-        model, _ = build_model(cfg=cfg)
+        model, _ = build_model(cfg=cfg.model)
         model = build_distwrapper(cfg=cfg, device=device, model=model, rank=rank)
         model.train()
 
-        old_model, _ = build_model(cfg=cfg)
+        old_model, _ = build_model(cfg=cfg.model)
         old_model = build_distwrapper(cfg=cfg, device=device, model=old_model, rank=rank)
         old_model.eval()
         for p in old_model.parameters():
@@ -37,6 +37,7 @@ def run_training(rank, world_size, cfg):
         trainer = build_trainer(cfg=cfg, model=model, old_model=old_model)
 
         collector = RolloutCollector(
+            cfg=cfg,
             model=trainer.model,
             value_head=trainer.value_head,
             reward_model=trainer.reward_model,
@@ -67,10 +68,11 @@ def run_training(rank, world_size, cfg):
 
         # 5) RL loop (each rank rolls out independently; PPO trains on local shard)
         buffer = RolloutBuffer()
-        update_every = 8
-        num_steps = 100
-        batch_size = 2
-        max_new_tokens = 32
+        update_every = cfg.trainer.update_every
+        num_steps = cfg.trainer.num_steps
+        batch_size = cfg.rollout.rollout_batch_size
+        max_new_tokens = cfg.rollout.max_new_tokens
+        buffer_size = cfg.rollout.buffer_size
 
         for step in range(num_steps):
             prompts_batch = choices(prompt_texts, k=batch_size)
@@ -84,33 +86,66 @@ def run_training(rank, world_size, cfg):
             if rank == 0:
                 print(f"[Rank {rank} | Step {step}] Collected {len(buffer.actions)} batches")
 
-            if (step + 1) % update_every == 0:
+            # if (step + 1) % update_every == 0:
+            #     if rank == 0:
+            #         print(f"\n[Rank {rank} | PPO Update @ step {step}] Using {len(buffer.actions)} rollouts")
+            #     target_device = f"cuda:{rank}"
+            #     buffer_data = buffer.get(target_device=target_device)
+                
+            #     if buffer_data is not None:
+            #         # Unpack the simplified buffer data
+            #         actions, attn_masks, prompt_masks, rewards, old_log_probs, old_values = buffer_data
+                    
+            #         metrics = trainer.train(
+            #             actions=actions,
+            #             attention_mask=attn_masks, 
+            #             prompt_mask=prompt_masks,
+            #             rewards=rewards,
+            #             old_log_probs=old_log_probs,
+            #             old_values=old_values
+            #         )
+            #     else:
+            #         metrics = {"loss": float('inf'), "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "mean_return": 0.0}
+
+            #     if rank == 0:
+            #         print(f"[Train] Loss: {metrics['loss']:.2f}, "
+            #               f"Policy: {metrics['policy_loss']:.2f}, "
+            #               f"Value: {metrics['value_loss']:.2f}, "
+            #               f"Entropy: {metrics['entropy']:.4f}, "
+            #               f"Return: {metrics['mean_return']:.2f}")
+
+            #     trainer.update_old_policy()
+            #     collector.set_old_model(trainer.old_model)
+
+            #     if rank == 0:
+            #         print("Updated old policy")
+
+            #     buffer.clear()
+
+            if len(buffer.actions) >= buffer_size:
                 if rank == 0:
                     print(f"\n[Rank {rank} | PPO Update @ step {step}] Using {len(buffer.actions)} rollouts")
-                target_device = f"cuda:{rank}"
-                buffer_data = buffer.get(target_device=target_device)
-                
+
+                buffer_data = buffer.get(target_device=f"cuda:{rank}")
                 if buffer_data is not None:
-                    # Unpack the simplified buffer data
                     actions, attn_masks, prompt_masks, rewards, old_log_probs, old_values = buffer_data
-                    
                     metrics = trainer.train(
                         actions=actions,
-                        attention_mask=attn_masks, 
+                        attention_mask=attn_masks,
                         prompt_mask=prompt_masks,
                         rewards=rewards,
                         old_log_probs=old_log_probs,
                         old_values=old_values
                     )
                 else:
-                    metrics = {"loss": float('inf'), "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "mean_return": 0.0}
+                    metrics = {"loss": float("inf"), "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "mean_return": 0.0}
 
                 if rank == 0:
                     print(f"[Train] Loss: {metrics['loss']:.2f}, "
-                          f"Policy: {metrics['policy_loss']:.2f}, "
-                          f"Value: {metrics['value_loss']:.2f}, "
-                          f"Entropy: {metrics['entropy']:.4f}, "
-                          f"Return: {metrics['mean_return']:.2f}")
+                        f"Policy: {metrics['policy_loss']:.2f}, "
+                        f"Value: {metrics['value_loss']:.2f}, "
+                        f"Entropy: {metrics['entropy']:.4f}, "
+                        f"Return: {metrics['mean_return']:.2f}")
 
                 trainer.update_old_policy()
                 collector.set_old_model(trainer.old_model)

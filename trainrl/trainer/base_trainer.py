@@ -8,23 +8,26 @@ import torch.distributed as dist
     
 class PPOTrainer:
     def __init__(
-        self, model, old_model, value_head, optimizer, reward_model,
-        gamma=0.99, lam=0.95, clip_eps=0.2, c1=0.5, c2=0.01,
-        ppo_epochs=4, batch_size=4, max_grad_norm=1.0
+        self, cfg, model, old_model, value_head, optimizer, reward_model,
+        # gamma=0.99, lam=0.95, clip_eps=0.2, c1=0.5, c2=0.01,
+        # ppo_epochs=4, batch_size=4, max_grad_norm=1.0, grad_accum_steps=4, 
+        device="cuda"
     ):
         self.model = model
         self.old_model = old_model
         self.value_head = value_head
         self.optimizer = optimizer
         self.reward_model = reward_model
-        self.gamma = gamma
-        self.lam = lam
-        self.clip_eps = clip_eps
-        self.c1 = c1
-        self.c2 = c2
-        self.ppo_epochs = ppo_epochs
-        self.batch_size = batch_size
-        self.max_grad_norm = max_grad_norm
+        self.gamma = cfg.ppo.gamma
+        self.lam = cfg.ppo.lam
+        self.clip_eps = cfg.ppo.clip_eps
+        self.c1 = cfg.ppo.c1
+        self.c2 = cfg.ppo.c2
+        self.ppo_epochs = cfg.ppo.ppo_epochs
+        self.batch_size = cfg.ppo.ppo_batch_size
+        self.max_grad_norm = cfg.ppo.max_grad_norm
+        self.grad_accum_steps = cfg.ppo.grad_accum_steps
+        self.device = device
 
     def compute_gae_masked(self, rewards, values, attention_mask, prompt_mask):
         """
@@ -73,110 +76,99 @@ class PPOTrainer:
 
         return adv.detach(), ret.detach()
 
-    def train(self, actions, attention_mask, prompt_mask, rewards, old_log_probs, old_values):
+    def train(self, actions, attention_mask, prompt_mask, rewards, old_log_probs, old_values, scaler=None):
         """
-        actions: [B, T] - The full token sequence (prompt + completion)
-        attention_mask: [B, T] - 1 for real tokens, 0 for padding
-        prompt_mask: [B, T] - 1.0 for generated tokens, 0.0 for prompt tokens
-        rewards: [B, T] - Rewards for each token
-        old_log_probs: [B, T] - Log probabilities from old policy
-        old_values: [B, T] - Value estimates from old policy
+        PPO training loop with gradient accumulation and optional AMP.
+        - scaler: optional torch.cuda.amp.GradScaler for mixed precision training
         """
-        
+
         total_loss_sum = 0
         policy_loss_sum = 0
         value_loss_sum = 0
         entropy_sum = 0
         batch_count = 0
-        
+
         for epoch in range(self.ppo_epochs):
             dataset = TensorDataset(actions, attention_mask, prompt_mask, rewards, old_log_probs, old_values)
             dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
-            for batch in dataloader:
+            self.optimizer.zero_grad(set_to_none=True)
+
+            for i, batch in enumerate(dataloader):
                 actions_b, attn_mask_b, prompt_mask_b, rewards_b, old_log_probs_b, old_values_b = batch
 
-                # Forward pass - use actions as input to model
-                logits, _ = self.model(actions_b, attn_mask=attn_mask_b)
-                log_probs = get_log_probs(logits, actions_b)
+                with torch.amp.autocast(enabled=(scaler is not None), device_type=self.device):
+                    # Forward pass
+                    logits, _ = self.model(actions_b, attn_mask=attn_mask_b)
+                    log_probs = get_log_probs(logits, actions_b)
 
-                # Value predictions
-                hidden_states = self.model.generate_hidden_states(actions_b, attn_mask=attn_mask_b)
-                values, _ = self.value_head(hidden_states)
-                values = values.squeeze(-1)
+                    # Value predictions
+                    hidden_states = self.model.generate_hidden_states(actions_b, attn_mask=attn_mask_b)
+                    values, _ = self.value_head(hidden_states)
+                    values = values.squeeze(-1)
 
-                # FIXED: Use the correct GAE function with proper parameters
-                advantages, returns = self.compute_gae_masked(
-                    rewards=rewards_b, 
-                    values=values, 
-                    attention_mask=attn_mask_b,  # FIXED: Pass attention_mask
-                    prompt_mask=prompt_mask_b
-                )
-                
-                # REMOVED: Double normalization - GAE function already normalizes
+                    # Compute GAE
+                    advantages, returns = self.compute_gae_masked(
+                        rewards=rewards_b,
+                        values=values,
+                        attention_mask=attn_mask_b,
+                        prompt_mask=prompt_mask_b,
+                    )
 
-                # PPO policy loss
-                ratios = torch.exp(log_probs - old_log_probs_b)
-                
-                surr1 = ratios * advantages
-                surr2 = torch.clamp(ratios, 1 - self.clip_eps, 1 + self.clip_eps) * advantages
-                policy_loss = -torch.min(surr1, surr2)
-                
-                # Apply mask and compute mean over generated tokens only
-                masked_policy_loss = policy_loss * prompt_mask_b
-                policy_loss = masked_policy_loss.sum() / (prompt_mask_b.sum() + 1e-8)
+                    # Policy loss
+                    ratios = torch.exp(log_probs - old_log_probs_b)
+                    surr1 = ratios * advantages
+                    surr2 = torch.clamp(ratios, 1 - self.clip_eps, 1 + self.clip_eps) * advantages
+                    policy_loss = -torch.min(surr1, surr2)
+                    policy_loss = (policy_loss * prompt_mask_b).sum() / (prompt_mask_b.sum() + 1e-8)
 
-                # Value loss with clipping for stability
-                value_pred_clipped = old_values_b + torch.clamp(
-                    values - old_values_b, -self.clip_eps, self.clip_eps
-                )
-                value_loss1 = (values - returns) ** 2
-                value_loss2 = (value_pred_clipped - returns) ** 2
-                value_loss = 0.5 * torch.max(value_loss1, value_loss2)
-                
-                # Apply mask and compute mean over generated tokens only
-                masked_value_loss = value_loss * prompt_mask_b
-                value_loss = masked_value_loss.sum() / (prompt_mask_b.sum() + 1e-8)
+                    # Value loss
+                    value_pred_clipped = old_values_b + torch.clamp(values - old_values_b, -self.clip_eps, self.clip_eps)
+                    value_loss1 = (values - returns) ** 2
+                    value_loss2 = (value_pred_clipped - returns) ** 2
+                    value_loss = 0.5 * torch.max(value_loss1, value_loss2)
+                    value_loss = (value_loss * prompt_mask_b).sum() / (prompt_mask_b.sum() + 1e-8)
 
-                # Entropy loss for exploration
-                entropy = -(F.softmax(logits, dim=-1) * F.log_softmax(logits, dim=-1)).sum(-1)
-                
-                # Apply mask and compute mean over generated tokens only
-                masked_entropy = entropy * prompt_mask_b
-                entropy = masked_entropy.sum() / (prompt_mask_b.sum() + 1e-8)
+                    # Entropy
+                    entropy = -(F.softmax(logits, dim=-1) * F.log_softmax(logits, dim=-1)).sum(-1)
+                    entropy = (entropy * prompt_mask_b).sum() / (prompt_mask_b.sum() + 1e-8)
 
-                # Total loss
-                total_loss = policy_loss + self.c1 * value_loss - self.c2 * entropy
+                    # PPO total loss
+                    total_loss = policy_loss + self.c1 * value_loss - self.c2 * entropy
 
-                # Check for NaN/inf before backward pass
                 if not torch.isfinite(total_loss):
                     print(f"Warning: Non-finite loss detected: {total_loss.item()}")
-                    print(f"  Policy loss: {policy_loss.item()}")
-                    print(f"  Value loss: {value_loss.item()}")
-                    print(f"  Entropy: {entropy.item()}")
-                    print(f"  Generated tokens: {prompt_mask_b.sum().item()}")
                     continue
 
-                # Backward pass
-                self.optimizer.zero_grad()
-                total_loss.backward()
-                
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(
-                    list(self.model.parameters()) + list(self.value_head.parameters()), 
-                    self.max_grad_norm
-                )
-                
-                self.optimizer.step()
-                
-                # Accumulate metrics for reporting
+                scaled_loss = total_loss / self.grad_accum_steps
+                if scaler is not None:
+                    scaler.scale(scaled_loss).backward()
+                else:
+                    scaled_loss.backward()
+
                 total_loss_sum += total_loss.item()
                 policy_loss_sum += policy_loss.item()
                 value_loss_sum += value_loss.item()
                 entropy_sum += entropy.item()
                 batch_count += 1
 
-        # Return average metrics across all batches and epochs
+                if (i + 1) % self.grad_accum_steps == 0:
+                    if scaler is not None:
+                        scaler.unscale_(self.optimizer)  # unscale before clipping
+                    torch.nn.utils.clip_grad_norm_(
+                        list(self.model.parameters()) + list(self.value_head.parameters()),
+                        self.max_grad_norm,
+                    )
+                    if scaler is not None:
+                        scaler.step(self.optimizer)
+                        scaler.update()
+                    else:
+                        self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)  # reset grads for next accumulation window
+
+                    del logits, log_probs, values, advantages, returns, hidden_states
+                    torch.cuda.empty_cache()
+
         if batch_count > 0:
             return {
                 "loss": total_loss_sum / batch_count,
@@ -186,18 +178,18 @@ class PPOTrainer:
                 "mean_return": returns.mean().item() if torch.isfinite(returns).all() else 0.0,
                 "mean_advantage": advantages.mean().item() if torch.isfinite(advantages).all() else 0.0,
                 "generated_tokens": prompt_mask.sum().item(),
-                "batches_processed": batch_count
+                "batches_processed": batch_count,
             }
         else:
             return {
-                "loss": float('inf'),
-                "policy_loss": float('inf'),
-                "value_loss": float('inf'),
+                "loss": float("inf"),
+                "policy_loss": float("inf"),
+                "value_loss": float("inf"),
                 "entropy": 0.0,
                 "mean_return": 0.0,
                 "mean_advantage": 0.0,
                 "generated_tokens": 0,
-                "batches_processed": 0
+                "batches_processed": 0,
             }
 
     def update_old_policy(self):

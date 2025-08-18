@@ -3,7 +3,8 @@ from trainer.utils import get_log_probs
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 class RolloutCollector:
-    def __init__(self, model, value_head, reward_model=None, device="cuda"):
+    def __init__(self, cfg, model, value_head, reward_model=None, device="cuda"):
+        self.cfg = cfg
         self.model = model
         self.tokenizer = model.embedding_model.tokenizer
         self.value_head = value_head
@@ -15,13 +16,13 @@ class RolloutCollector:
 
         self.reward_mean_ma = 0.0
         self.reward_std_ma = 1.0
-        self.reward_ma_beta = 0.9 
+        self.reward_ma_beta = self.cfg.rewards.reward_ma_beta
 
     def set_old_model(self, old_model):
         self.old_model = old_model
         self.old_model.cuda()
 
-    def _compute_rewards(self, full_texts, prompt_mask, reward_type="dense"):
+    def _compute_rewards(self, full_texts, prompt_mask, reward_type="terminal"):
         with torch.no_grad():
             scores = self.reward_model(full_texts)  # [B]
             if not isinstance(scores, torch.Tensor):
@@ -84,14 +85,6 @@ class RolloutCollector:
         elif hasattr(model, 'wrapped_model') and isinstance(model.wrapped_model, FSDP):
             return model.wrapped_model
         return model
-
-    def _get_model_dtype(self, model):
-        """Get the dtype of the model parameters"""
-        # Try to get dtype from the first parameter
-        for param in model.parameters():
-            return param.dtype
-        # Fallback to float32 since mixed precision is disabled
-        return torch.float32
 
     def _safe_model_call(self, model, method_name, *args, **kwargs):
         """Safely call model methods, handling FSDP contexts properly"""
@@ -164,7 +157,7 @@ class RolloutCollector:
             prompt_mask[i, prompt_len:] = 1.0  # 1.0 = generated
 
         # Step 6: Rewards - NOW USING TEXT INSTEAD OF TOKEN IDS
-        rewards = self._compute_rewards(full_texts, prompt_mask)
+        rewards = self._compute_rewards(full_texts, prompt_mask, self.cfg.rewards.type)
 
         # Step 7: Old policy outputs (log_probs, values)
         if self.old_model is None:
